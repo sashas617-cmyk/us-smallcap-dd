@@ -174,6 +174,31 @@ def fmp_json(endpoint: str, params: dict[str, Any] | None = None, ttl_hours: flo
         print(f"WARN: FMP fetch failed {endpoint}: {msg}", file=sys.stderr)
         return None
 
+
+def fmp_batch_metrics(tickers: list[str], endpoints: list[str] | None = None, ttl_hours: float = 4) -> dict[str, dict[str, Any]]:
+    """Fetch key metrics for multiple tickers using cached FMP data where possible.
+    Returns {TICKER: {endpoint: data}} for each ticker that has data.
+    """
+    if endpoints is None:
+        endpoints = ["profile", "key-metrics", "ratios-ttm", "quote"]
+    results: dict[str, dict[str, Any]] = {}
+    for i, ticker in enumerate(tickers):
+        if i > 0 and i % 5 == 0:
+            time.sleep(1.0)
+        row: dict[str, Any] = {}
+        for ep in endpoints:
+            ep_params = {"symbol": ticker, "period": "annual"}
+            if ep != "quote":
+                ep_params["limit"] = "1"
+            data = fmp_json(ep, ep_params, ttl_hours=ttl_hours)
+            if isinstance(data, list) and data:
+                row[ep] = data[0]
+            elif isinstance(data, dict):
+                row[ep] = data
+        if row:
+            results[ticker] = row
+    return results
+
 def first_row(x: Any) -> dict[str, Any]:
     if isinstance(x, list) and x and isinstance(x[0], dict):
         return x[0]

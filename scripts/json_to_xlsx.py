@@ -127,19 +127,27 @@ def score_style(cell) -> None:
 
 
 def finish_sheet(ws, header_row: int, max_width: int = 30) -> None:
-    for r in range(header_row+1, ws.max_row+1):
-        base = ZEBRA_FILL if (r-header_row) % 2 == 0 else WHITE_FILL
-        for c in range(1, ws.max_column+1):
-            cell=ws.cell(r,c); cell.border=THIN_BORDER
-            if not cell.font or cell.font == Font(): cell.font=NORMAL_FONT
-            if cell.fill.fill_type is None: cell.fill=base
-            cell.alignment=Alignment(vertical="top", wrap_text=True)
-    for col in range(1, ws.max_column+1):
-        letter=get_column_letter(col); width=10
-        for cell in ws[letter]:
-            if cell.value is not None:
-                width=max(width, min(max_width, len(str(cell.value))+2))
-        ws.column_dimensions[letter].width=max(10, min(max_width, width))
+    # Set column widths based on header text + data
+    for col in range(1, ws.max_column + 1):
+        header_text = str(ws.cell(header_row, col).value or "")
+        # Min width from header, max from content scan
+        max_len = max(len(header_text), 6)
+        for row in range(header_row + 1, ws.max_row + 1):
+            val = ws.cell(row, col).value
+            if val is not None:
+                max_len = max(max_len, min(max_width, len(str(val)) + 2))
+        ws.column_dimensions[get_column_letter(col)].width = max(6, min(max_width, max_len))
+    # Zebra stripe + borders + vertical alignment
+    for r in range(header_row + 1, ws.max_row + 1):
+        base = ZEBRA_FILL if (r - header_row) % 2 == 0 else WHITE_FILL
+        for c in range(1, ws.max_column + 1):
+            cell = ws.cell(r, c)
+            cell.border = THIN_BORDER
+            if not cell.font or cell.font == Font():
+                cell.font = NORMAL_FONT
+            if cell.fill.fill_type is None:
+                cell.fill = base
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
 
 
 def add_score_conditional(ws, col: int, first: int, last: int) -> None:
