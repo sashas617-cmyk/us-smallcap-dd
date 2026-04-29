@@ -256,6 +256,8 @@ def sec_financials(ticker: str) -> dict[str, Any]:
 
 def fetch_bulk_screener() -> list[dict[str, Any]]:
     # /stable/ has no stock screener. Start from stock-list, then enrich per ticker.
+    # NOTE: FMP /stable/stock-list returns {symbol, companyName} — no exchangeShortName.
+    # We accept all valid US tickers and filter by universe later.
     data = fmp_json("stock-list", ttl_hours=24) or []
     rows: list[dict[str, Any]] = []
     if isinstance(data, list):
@@ -263,8 +265,9 @@ def fetch_bulk_screener() -> list[dict[str, Any]]:
             if not isinstance(r, dict):
                 continue
             sym = str(r.get("symbol") or "").upper().replace(".", "-")
-            if re.fullmatch(r"[A-Z][A-Z0-9-]{0,5}", sym) and str(r.get("exchangeShortName") or "").upper() in {"NASDAQ", "NYSE", "AMEX"}:
-                rows.append({"symbol": sym, "companyName": r.get("name"), "price": r.get("price"), "exchange": r.get("exchangeShortName")})
+            # Accept 1-5 char uppercase tickers (covers NASDAQ, NYSE, AMEX)
+            if re.fullmatch(r"[A-Z][A-Z0-9-]{0,5}", sym):
+                rows.append({"symbol": sym, "companyName": r.get("name") or r.get("companyName"), "price": r.get("price"), "exchange": r.get("exchangeShortName") or r.get("exchange") or ""})
     return rows
 
 def fetch_available_symbols() -> list[str]:
@@ -438,15 +441,15 @@ def screen(universe: str) -> tuple[list[Candidate], int]:
     universe_tickers = set(fetch_ishares_universe() if universe == "r2k" else SP600_FALLBACK)
     rows = fetch_bulk_screener()
     row_by_ticker = {str(r.get("symbol", "")).upper(): r for r in rows if r.get("symbol")}
-    tickers = [t for t in row_by_ticker if not universe_tickers or t in universe_tickers]
-    cap = int(os.environ.get("RUSSELL_SCREENER_LIMIT", os.environ.get("RUSSELL_SCREENER_FALLBACK_LIMIT", "12")))
+    # Intersect FMP stock-list with universe (sorted for determinism)
+    if row_by_ticker:
+        tickers = sorted([t for t in row_by_ticker if t in universe_tickers])
+    else:
+        # FMP stock-list empty — use sorted universe directly
+        tickers = sorted(universe_tickers)
+    cap = int(os.environ.get("RUSSELL_SCREENER_LIMIT", "0"))  # 0 = no limit, full scan
     if cap > 0:
         tickers = tickers[:cap]
-    if len(tickers) < 5:
-        available = set(fetch_available_symbols())
-        base = [t for t in universe_tickers if not available or t in available]
-        # Keep smoke tests sane; a full run can raise this limit.
-        tickers = list(dict.fromkeys(tickers + base))[:cap]
     candidates: list[Candidate] = []
     for i, t in enumerate(tickers, 1):
         try:
@@ -482,6 +485,9 @@ def output_item(c: Candidate, rank: int, include_dd: bool) -> dict[str, Any]:
     }
     if include_dd:
         item.update(run_dd(c))
+    else:
+        # Always provide a verdict from screener-level data, even without full DD
+        item.update(dd_fallback(c))
     return item
 
 def print_summary(items: list[dict[str, Any]]) -> None:
