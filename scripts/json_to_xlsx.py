@@ -79,7 +79,7 @@ def score_value(row: dict[str, Any]) -> float | None:
     s = row.get("composite_score", row.get("score"))
     x=num(s)
     if x is not None:
-        return round(x*10,1) if 0 <= x <= 1 else round(x,1)
+        return round(x,1)
     scores = row.get("layer_scores") or row.get("dd_scores") or {}
     vals=[num(scores.get(k)) for k,_ in LAYER_KEYS if num(scores.get(k)) is not None]
     return round(sum(vals)/len(vals),1) if vals else None
@@ -126,17 +126,34 @@ def score_style(cell) -> None:
     else: cell.fill=RED_FILL; cell.font=Font("Calibri",10,bold=True,color=WHITE)
 
 
+def _display_len(val: Any, nfmt: str) -> int:
+    if val is None: return 0
+    if isinstance(val, (int, float)):
+        if "%" in nfmt:
+            return len(f"{val*100:.1f}%")
+        if "0.00" in nfmt:
+            return len(f"{val:.2f}")
+        if "0.0" in nfmt:
+            return len(f"{val:.1f}")
+        return len(f"{val:.0f}")
+    s = str(val)
+    # For multi-line cells, take longest line
+    if "\n" in s:
+        return max(len(line) for line in s.split("\n"))
+    return len(s)
+
+
 def finish_sheet(ws, header_row: int, max_width: int = 30) -> None:
-    # Set column widths based on header text + data
+    # Set column widths based on header text + visible (formatted) data
     for col in range(1, ws.max_column + 1):
         header_text = str(ws.cell(header_row, col).value or "")
-        # Min width from header, max from content scan
-        max_len = max(len(header_text), 6)
+        max_len = max(len(header_text) + 2, 7)
         for row in range(header_row + 1, ws.max_row + 1):
-            val = ws.cell(row, col).value
-            if val is not None:
-                max_len = max(max_len, min(max_width, len(str(val)) + 2))
-        ws.column_dimensions[get_column_letter(col)].width = max(6, min(max_width, max_len))
+            cell = ws.cell(row, col)
+            disp = _display_len(cell.value, cell.number_format or "General")
+            if disp > 0:
+                max_len = max(max_len, min(max_width, disp + 2))
+        ws.column_dimensions[get_column_letter(col)].width = max(7, min(max_width, max_len))
     # Zebra stripe + borders + vertical alignment
     for r in range(header_row + 1, ws.max_row + 1):
         base = ZEBRA_FILL if (r - header_row) % 2 == 0 else WHITE_FILL
@@ -205,27 +222,31 @@ def convert_screener(data: dict[str, Any], output_path: Path):
     for i,r in enumerate(rows,5):
         scores=r.get('layer_scores') or r.get('dd_scores') or {}
         verdict_raw = r.get('dd_verdict') or r.get('verdict')
-        verdict_display = verdict_raw or "Pending DD"
+        verdict_display = verdict_raw or DASH
         red_flags_list = r.get('red_flags') or []
         catalysts_list = r.get('catalysts') or []
-        red_flags_text = ', '.join(map(str, red_flags_list)) if red_flags_list else DASH
-        catalysts_text = ', '.join(map(str, catalysts_list)) if catalysts_list else DASH
-        next_step = f"uv run scripts/dd_scan.py --ticker {r.get('ticker')}" if not verdict_raw else (r.get('one_line_summary') or r.get('dd_summary') or r.get('summary') or DASH)
+        # Filter out placeholder "—" entries
+        red_flags_list = [x for x in red_flags_list if x and str(x) != "—"]
+        catalysts_list = [x for x in catalysts_list if x and str(x) != "—"]
+        red_flags_text = '\n'.join(f"• {x}" for x in red_flags_list) if red_flags_list else DASH
+        catalysts_text = '\n'.join(f"• {x}" for x in catalysts_list) if catalysts_list else DASH
+        next_step = r.get('one_line_summary') or r.get('dd_summary') or r.get('summary') or DASH
         layer_vals = [num(scores.get(k)) for k,_ in LAYER_KEYS]
-        layer_vals = [(v if v is not None else "Pending DD") for v in layer_vals]
+        layer_vals = [(v if v is not None else DASH) for v in layer_vals]
         score_v = score_value(r)
-        score_display = score_v if score_v is not None else "Pending DD"
+        score_display = score_v if score_v is not None else DASH
         vals=[r.get('ticker'), verdict_display, score_display] + layer_vals + [red_flags_text, catalysts_text, next_step]
         for c,v in enumerate(vals,1): ws2.cell(i,c,v).border=THIN_BORDER
         ws2.cell(i,2).fill=verdict_fill(verdict_raw if verdict_raw else None)
         ws2.cell(i,2).font=VERDICT_FONT
         ws2.cell(i,2).alignment=Alignment(horizontal='center', vertical='center', wrap_text=True)
         for c in range(3,10):
-            if isinstance(ws2.cell(i,c).value, (int, float)):
-                score_style(ws2.cell(i,c))
+            cell = ws2.cell(i,c)
+            if isinstance(cell.value, (int, float)):
+                score_style(cell)
             else:
-                ws2.cell(i,c).font=Font("Calibri", 9, italic=True, color=GREY)
-                ws2.cell(i,c).alignment=Alignment(horizontal='center', vertical='center')
+                cell.font=Font("Calibri", 10, color=GREY)
+                cell.alignment=Alignment(horizontal='center', vertical='center')
     for c in range(3,10): add_score_conditional(ws2,c,5,ws2.max_row)
     finish_sheet(ws2,4, max_width=50)
     wb.save(output_path); return output_path

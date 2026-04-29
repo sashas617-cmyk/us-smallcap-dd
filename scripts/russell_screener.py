@@ -359,19 +359,30 @@ def enrich_ticker(ticker: str, screener_row: dict[str, Any] | None = None) -> Ca
     uw_mp = uw_json(f"https://api.unusualwhales.com/api/stock/{ticker}/max-pain", ttl_hours=12) or {}
 
     market_cap = n(quote.get("marketCap") or prof.get("marketCap") or metrics.get("marketCap"))
-    # P/E: try ratios-ttm, then key-metrics peRatio, then quote, then compute from earningsYield (1/EY)
-    pe = n(ratios.get("priceEarningsRatioTTM") or ratios.get("priceEarningsRatio") or metrics.get("peRatio") or quote.get("pe"))
+    # P/E: prefer earningsYield-derived (annual, stable), fall back to TTM ratio.
+    # Negative P/E is meaningless (unprofitable) — return None so display shows "—".
+    pe = None
+    ey_raw = n(metrics.get("earningsYield"))
+    if ey_raw and ey_raw > 0:
+        pe = round(1 / ey_raw, 2)
     if pe is None:
-        ey = n(metrics.get("earningsYield"))
-        if ey and ey > 0:
-            pe = round(1 / ey, 2)
+        pe_raw = n(ratios.get("priceToEarningsRatioTTM") or ratios.get("priceEarningsRatioTTM") or metrics.get("peRatio") or quote.get("pe"))
+        if pe_raw is not None and pe_raw > 0:
+            pe = pe_raw
     forward_pe = n(quote.get("epsEstimatedNextYear"))
     pb = n(ratios.get("priceToBookRatioTTM") or metrics.get("pbRatio"))
+    if pb is not None and pb <= 0: pb = None  # negative book value → meaningless
     ps = n(ratios.get("priceToSalesRatioTTM") or metrics.get("priceToSalesRatio"))
-    pfcf = n(metrics.get("pocfratio") or metrics.get("pfcfRatio"))
-    debt_equity = n(ratios.get("debtEquityRatioTTM") or metrics.get("debtToEquity"))
+    pfcf = n(ratios.get("priceToFreeCashFlowRatioTTM") or metrics.get("pfcfRatio") or metrics.get("pocfratio"))
+    if pfcf is not None and pfcf <= 0: pfcf = None  # negative FCF → meaningless
+    debt_equity = n(ratios.get("debtToEquityRatioTTM") or ratios.get("debtEquityRatioTTM") or metrics.get("debtToEquity"))
+    # FMP returns 0 for several ratios when the underlying data is missing — treat zeros as null for these
+    if debt_equity == 0:
+        debt_equity = None
     current_ratio = n(ratios.get("currentRatioTTM") or metrics.get("currentRatio"))
-    roe = n(ratios.get("returnOnEquityTTM") or metrics.get("roe"))
+    if current_ratio == 0:
+        current_ratio = n(metrics.get("currentRatio"))
+    roe = n(ratios.get("returnOnEquityTTM") or metrics.get("returnOnEquity") or metrics.get("roe"))
     if roe is not None and roe > 1: roe /= 100
     profit_margin = n(ratios.get("netProfitMarginTTM") or inc.get("netIncomeRatio"))
     if profit_margin is not None and profit_margin > 1: profit_margin /= 100
@@ -431,32 +442,52 @@ def score(c: Candidate, sector_pb_median: float | None) -> float:
 def dd_fallback(c: Candidate) -> dict[str, Any]:
     red_flags, catalysts = [], []
     if c.fcf_yield is None or c.fcf_yield <= 0: red_flags.append("FCF not positive on latest annual cash-flow data")
-    if c.debt_equity is not None and c.debt_equity > 1.2: red_flags.append("Leverage is elevated for a small-cap value candidate")
-    if c.roe is not None and c.roe < 0.08: red_flags.append("ROE below normal quality threshold")
+    if c.debt_equity is not None and c.debt_equity > 1.2: red_flags.append("Leverage elevated (D/E > 1.2)")
+    if c.roe is not None and c.roe < 0.08: red_flags.append("ROE below 8% quality threshold")
     if c.pe is None: red_flags.append("P/E not available (likely unprofitable)")
-    if c.latest_10k: catalysts.append(f"Next annual filing cycle, latest 10-K seen: {c.latest_10k}")
+    if c.pb is not None and c.pb > 5: red_flags.append(f"P/B elevated ({c.pb:.1f}) — premium valuation")
+    if c.revenue_growth is not None and c.revenue_growth < 0: red_flags.append(f"Revenue declining ({100*c.revenue_growth:.1f}% YoY)")
+    if c.short_float is not None and c.short_float >= 0.10: red_flags.append(f"Short float {100*c.short_float:.1f}% — bear thesis active")
+    if c.latest_10k: catalysts.append(f"Latest 10-K filed: {c.latest_10k}")
     if c.composite_score >= 7 and len(red_flags) <= 1:
         verdict = "DEEP_VALUE"
     elif c.composite_score >= 4:
         verdict = "VALUE_TRAP"
     else:
         verdict = "NOT_INVESTABLE"
-    # Populate layer scores from screener data (Phase 1 only)
+
+    # 1-10 layer scores (None if data missing — surface as "—" in Excel)
+    def quality_score():
+        # Profit margin proxy
+        if c.profit_margin is None: return None
+        return round(max(0, min(10, c.profit_margin / 0.20 * 10)), 1)
+    def financial_score():
+        # Revenue growth proxy
+        if c.revenue_growth is None: return None
+        return round(max(0, min(10, (c.revenue_growth + 0.10) / 0.30 * 10)), 1)
+    def cashflow_score():
+        if c.fcf_yield is None: return None
+        return round(max(0, min(10, c.fcf_yield / 0.12 * 10)), 1)
+    def debt_score():
+        if c.debt_equity is None: return None
+        # 0 = perfect (10), 2.0 = bad (0)
+        return round(max(0, min(10, (2.0 - c.debt_equity) / 2.0 * 10)), 1)
+    def gov_score():
+        if c.short_float is None: return None
+        # Low short interest = good
+        return round(max(0, min(10, (0.20 - c.short_float) / 0.20 * 10)), 1)
+    def val_score():
+        return round(max(0, min(10, c.composite_score)), 1) if c.composite_score is not None else None
+
     scores = {
-        "business_quality": None,
-        "financial_performance": c.revenue_growth,  # YoY growth as financial proxy
-        "cash_flow_reality": c.fcf_yield,  # FCF yield
-        "debt_capital_structure": c.debt_equity,  # D/E ratio
-        "ownership_governance": c.short_float,  # Short float as governance proxy
-        "valuation": c.composite_score,  # Composite score
+        "business_quality": quality_score(),
+        "financial_performance": financial_score(),
+        "cash_flow_reality": cashflow_score(),
+        "debt_capital_structure": debt_score(),
+        "ownership_governance": gov_score(),
+        "valuation": val_score(),
     }
-    # Convert raw values to 1-10 scale for display
-    def to_score(val, thresholds=None):
-        if val is None: return None
-        if thresholds: return val  # already a score
-        return round(val, 1)
-    scores_display = {k: to_score(v) for k, v in scores.items()}
-    return {"dd_verdict": verdict, "dd_scores": scores_display, "dd_summary": f"{verdict}: screen score {c.composite_score}/10, FCF yield {fmt_pct(c.fcf_yield)}, ROE {fmt_pct(c.roe)}, D/E {fmt(c.debt_equity)}.", "red_flags": red_flags or ["—"], "catalysts": catalysts or ["—"], "dd_note": "Phase 1 screener score — run dd_scan.py for full 6-layer DD"}
+    return {"dd_verdict": verdict, "dd_scores": scores, "dd_summary": f"{verdict}: screen score {c.composite_score}/10, FCF yield {fmt_pct(c.fcf_yield)}, ROE {fmt_pct(c.roe)}, D/E {fmt(c.debt_equity)}.", "red_flags": red_flags or ["—"], "catalysts": catalysts or ["—"], "dd_note": "Phase 1 screener score — run dd_scan.py for full 6-layer DD"}
 
 def run_dd(c: Candidate) -> dict[str, Any]:
     dd_path = SCRIPT_DIR / "dd_scan.py"
