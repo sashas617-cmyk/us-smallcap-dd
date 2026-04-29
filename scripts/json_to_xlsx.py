@@ -1,314 +1,291 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["openpyxl"]
+# dependencies = ["openpyxl", "requests", "beautifulsoup4", "tabulate"]
 # ///
-"""Add Excel (.xlsx) export to dd_scan.py and russell_screener.py outputs.
+"""Professional Excel export for US Small-Cap DD Scanner outputs."""
+from __future__ import annotations
 
-Reads the JSON results and produces formatted Excel workbooks with:
-- Summary sheet (top-level verdicts and scores)
-- Details sheet (per-ticker metrics)
-- Conditional formatting for scores and verdicts
-
-Usage:
-  uv run scripts/json_to_xlsx.py                    # Convert today's screener results
-  uv run scripts/json_to_xlsx.py --date 2026-04-29  # Specific date
-  uv run scripts/json_to_xlsx.py --dd                # Convert DD scan results
-  uv run scripts/json_to_xlsx.py --all              # Convert all available dates
-"""
-
-import argparse
-import json
-import os
-import sys
-from datetime import datetime
+import argparse, importlib.util, json, os, sys
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
+
 from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.formatting.rule import CellIsRule
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-RESULTS_DIR = Path(os.path.expanduser("~/.openclaw/workspace/data/dd_results"))
+WORKSPACE = Path(os.path.expanduser("~/.openclaw/workspace"))
+SKILL_DIR = WORKSPACE / "skills" / "us-smallcap-dd"
+RESULTS_DIR = WORKSPACE / "data" / "dd_results"
+WATCHLIST = Path(os.path.expanduser("~/.openclaw/watchlist.json"))
 
-# Colors
-NAVY = "0A1929"
-BLUE = "1D9BF0"
-RED_HEX = "E63946"
-ORANGE_HEX = "F4A261"
-GREEN_HEX = "2A9D8F"
-GREY_HEX = "5A6C7D"
-LIGHT_GREY = "F0F4F8"
-WHITE = "FFFFFF"
+NAVY="0A1929"; GREEN="2A9D8F"; ORANGE="F4A261"; RED="E63946"; GREY="5A6C7D"; LIGHT="F0F4F8"; WHITE="FFFFFF"; BORDER="D0D0D0"
+HEADER_FILL=PatternFill("solid", fgColor=NAVY); TITLE_FILL=PatternFill("solid", fgColor=NAVY)
+GREEN_FILL=PatternFill("solid", fgColor=GREEN); ORANGE_FILL=PatternFill("solid", fgColor=ORANGE); RED_FILL=PatternFill("solid", fgColor=RED)
+ZEBRA_FILL=PatternFill("solid", fgColor=LIGHT); WHITE_FILL=PatternFill("solid", fgColor=WHITE)
+HEADER_FONT=Font("Calibri", 11, bold=True, color=WHITE); TITLE_FONT=Font("Calibri", 14, bold=True, color=WHITE)
+SUBTITLE_FONT=Font("Calibri", 10, italic=True, color=GREY); NORMAL_FONT=Font("Calibri", 10); BOLD_FONT=Font("Calibri", 10, bold=True)
+VERDICT_FONT=Font("Calibri", 10, bold=True, color=WHITE)
+THIN_BORDER=Border(left=Side("thin", color=BORDER), right=Side("thin", color=BORDER), top=Side("thin", color=BORDER), bottom=Side("thin", color=BORDER))
 
-# Fills
-HEADER_FILL = PatternFill(start_color=NAVY, end_color=NAVY, fill_type="solid")
-DEEP_VALUE_FILL = PatternFill(start_color=GREEN_HEX, end_color=GREEN_HEX, fill_type="solid")
-VALUE_TRAP_FILL = PatternFill(start_color=ORANGE_HEX, end_color=ORANGE_HEX, fill_type="solid")
-NOT_INVEST_FILL = PatternFill(start_color=RED_HEX, end_color=RED_HEX, fill_type="solid")
-LIGHT_ROW = PatternFill(start_color=LIGHT_GREY, end_color=LIGHT_GREY, fill_type="solid")
-
-# Fonts
-HEADER_FONT = Font(name="Calibri", size=11, bold=True, color=WHITE)
-TITLE_FONT = Font(name="Calibri", size=14, bold=True, color=NAVY)
-BOLD_FONT = Font(name="Calibri", size=10, bold=True)
-NORMAL_FONT = Font(name="Calibri", size=10)
-VERDICT_FONT = Font(name="Calibri", size=10, bold=True, color=WHITE)
-LINK_FONT = Font(name="Calibri", size=10, color=BLUE, underline="single")
-
-THIN_BORDER = Border(
-    left=Side(style='thin', color='D0D0D0'),
-    right=Side(style='thin', color='D0D0D0'),
-    top=Side(style='thin', color='D0D0D0'),
-    bottom=Side(style='thin', color='D0D0D0')
-)
+LAYER_KEYS=[("business_quality","Business"),("financial_performance","Financial"),("cash_flow_reality","Cash Flow"),("debt_capital_structure","Debt/Capital"),("ownership_governance","Governance"),("valuation","Valuation")]
 
 
-def verdict_fill(verdict: str) -> PatternFill:
-    v = (verdict or "").upper()
-    if "DEEP" in v or "VALUE" in v and "TRAP" not in v:
-        return DEEP_VALUE_FILL
-    if "TRAP" in v:
-        return VALUE_TRAP_FILL
-    if "NOT" in v or "AVOID" in v:
-        return NOT_INVEST_FILL
-    return PatternFill(start_color=GREY_HEX, end_color=GREY_HEX, fill_type="solid")
-
-
-def format_pct(val) -> str:
-    if val is None or val == "N/A":
-        return "N/A"
+def num(x: Any) -> float | None:
+    if x in (None, "", "N/A", "None", "-"): return None
     try:
-        v = float(val)
-        if abs(v) < 1:
-            return f"{v:.2%}"
-        return f"{v:.1f}%"
-    except (ValueError, TypeError):
-        return str(val)
+        if isinstance(x, str):
+            s=x.strip().replace(",", "").replace("$", "")
+            pct=s.endswith("%");
+            if pct: s=s[:-1]
+            mult=1.0
+            if s.upper().endswith("T"): mult=1e12; s=s[:-1]
+            elif s.upper().endswith("B"): mult=1e9; s=s[:-1]
+            elif s.upper().endswith("M"): mult=1e6; s=s[:-1]
+            elif s.upper().endswith("K"): mult=1e3; s=s[:-1]
+            v=float(s)*mult
+            return v/100 if pct else v
+        return float(x)
+    except Exception:
+        return None
 
 
-def format_num(val, decimals=2) -> str:
-    if val is None or val == "N/A":
-        return "N/A"
-    try:
-        return f"{float(val):,.{decimals}f}"
-    except (ValueError, TypeError):
-        return str(val)
+def market_cap_value(row: dict[str, Any]) -> float | None:
+    v = row.get("market_cap") or row.get("marketCap") or row.get("key_metrics",{}).get("market_cap")
+    mv = num(v)
+    if mv is not None: return mv
+    m = num(row.get("market_cap_M"))
+    return m*1e6 if m is not None else None
 
 
-def format_mcap(val) -> str:
-    if val is None or val == "N/A":
-        return "N/A"
-    try:
-        v = float(val)
-        if v >= 1e12:
-            return f"${v/1e12:.1f}T"
-        if v >= 1e9:
-            return f"${v/1e9:.1f}B"
-        if v >= 1e6:
-            return f"${v/1e6:.0f}M"
-        return f"${v:,.0f}"
-    except (ValueError, TypeError):
-        return str(val)
+def fmt_mcap(v: Any) -> str:
+    x=num(v)
+    if x is None: return "N/A"
+    if x >= 1e12: return f"${x/1e12:.1f}T"
+    if x >= 1e9: return f"${x/1e9:.1f}B"
+    if x >= 1e6: return f"${x/1e6:.0f}M"
+    return f"${x:,.0f}"
 
 
-def convert_screener(data: dict, output_path: Path):
-    wb = Workbook()
-
-    # ===== Summary Sheet =====
-    ws = wb.active
-    ws.title = "Summary"
-    ws.sheet_properties.tabColor = "1D9BF0"
-
-    # Title
-    ws.merge_cells('A1:L1')
-    ws['A1'] = f"Russell 2000 Value Screener — {data.get('date', 'N/A')}"
-    ws['A1'].font = TITLE_FONT
-    ws['A1'].alignment = Alignment(horizontal='left')
-
-    ws['A2'] = f"Universe: {data.get('universe', 'r2k')} | Screened: {data.get('candidates_screened', 'N/A')} | Passing filters: {data.get('candidates_passing_filters', 'N/A')}"
-    ws['A2'].font = Font(name="Calibri", size=9, color=GREY_HEX)
-
-    # Headers
-    headers = ["#", "Ticker", "Sector", "MCap", "Score", "P/E", "P/B", "P/FCF",
-               "FCF Yield", "Debt/Eq", "ROE", "Rev YoY", "Verdict", "Summary"]
-    col_widths = [4, 10, 20, 12, 8, 8, 8, 8, 10, 10, 8, 10, 14, 50]
-
-    for col, (header, width) in enumerate(zip(headers, col_widths), 1):
-        cell = ws.cell(row=4, column=col, value=header)
-        cell.font = HEADER_FONT
-        cell.fill = HEADER_FILL
-        cell.alignment = Alignment(horizontal='center', vertical='center')
-        cell.border = THIN_BORDER
-        ws.column_dimensions[get_column_letter(col)].width = width
-
-    # Data rows
-    candidates = data.get("top_picks", data.get("results", []))
-    for idx, pick in enumerate(candidates, 1):
-        row = idx + 4
-        verdict = pick.get("dd_verdict", pick.get("verdict", ""))
-        values = [
-            idx,
-            pick.get("ticker", ""),
-            pick.get("sector", ""),
-            format_mcap(pick.get("market_cap_M") or pick.get("key_metrics", {}).get("market_cap")),
-            pick.get("composite_score", pick.get("rank", "")),
-            format_pct(pick.get("pe") or pick.get("key_metrics", {}).get("p_e")),
-            format_pct(pick.get("pb") or pick.get("key_metrics", {}).get("p_b")),
-            format_pct(pick.get("pfcf") or pick.get("key_metrics", {}).get("p_fcf")),
-            format_pct(pick.get("fcf_yield") or pick.get("key_metrics", {}).get("fcf_margin_latest")),
-            format_pct(pick.get("debt_equity") or pick.get("key_metrics", {}).get("debt_to_equity_finviz")),
-            format_pct(pick.get("roe") or pick.get("key_metrics", {}).get("roe")),
-            format_pct(pick.get("revenue_growth") or pick.get("key_metrics", {}).get("revenue_cagr_5y")),
-            verdict,
-            pick.get("dd_summary", pick.get("one_line_summary", "")),
-        ]
-        for col, val in enumerate(values, 1):
-            cell = ws.cell(row=row, column=col, value=val)
-            cell.font = NORMAL_FONT
-            cell.border = THIN_BORDER
-            if idx % 2 == 0:
-                cell.fill = LIGHT_ROW
-            if col == 13:  # Verdict column
-                cell.fill = verdict_fill(verdict)
-                cell.font = VERDICT_FONT
-                cell.alignment = Alignment(horizontal='center')
-
-    # ===== Details Sheet =====
-    if candidates:
-        ws2 = wb.create_sheet("Details")
-        ws2.sheet_properties.tabColor = "2A9D8F"
-
-        detail_headers = ["Ticker", "Verdict", "Business Quality", "Financial Performance",
-                          "Cash Flow Reality", "Debt & Capital", "Ownership & Governance",
-                          "Valuation", "Red Flags", "Catalysts", "Data Quality"]
-        for col, header in enumerate(detail_headers, 1):
-            cell = ws2.cell(row=1, column=col, value=header)
-            cell.font = HEADER_FONT
-            cell.fill = HEADER_FILL
-            cell.border = THIN_BORDER
-
-        for idx, pick in enumerate(candidates, 2):
-            metrics = pick.get("key_metrics", {})
-            dd_scores = pick.get("dd_scores", pick.get("layer_scores", {}))
-            verdict = pick.get("dd_verdict", pick.get("verdict", ""))
-
-            values = [
-                pick.get("ticker", ""),
-                verdict,
-                dd_scores.get("business_quality", ""),
-                dd_scores.get("financial_performance", ""),
-                dd_scores.get("cash_flow_reality", ""),
-                dd_scores.get("debt_capital_structure", dd_scores.get("debt_quality", "")),
-                dd_scores.get("ownership_governance", ""),
-                dd_scores.get("valuation", ""),
-                ", ".join(pick.get("red_flags", [])) if pick.get("red_flags") else "None",
-                ", ".join(pick.get("catalysts", [])) if pick.get("catalysts") else "None",
-                str(pick.get("data_quality", "")),
-            ]
-            for col, val in enumerate(values, 1):
-                cell = ws2.cell(row=idx, column=col, value=val)
-                cell.font = NORMAL_FONT
-                cell.border = THIN_BORDER
-                if col == 2:
-                    cell.fill = verdict_fill(verdict)
-                    cell.font = VERDICT_FONT
-                    cell.alignment = Alignment(horizontal='center')
-
-    wb.save(str(output_path))
-    return output_path
+def pct_value(v: Any) -> float | None:
+    x=num(v)
+    if x is None: return None
+    return x/100 if abs(x)>1.5 else x
 
 
-def convert_dd(data: dict, output_path: Path):
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "DD Results"
-
-    ws.merge_cells('A1:J1')
-    ws['A1'] = f"Due Diligence Scan — {data.get('date', 'N/A')}"
-    ws['A1'].font = TITLE_FONT
-
-    headers = ["Ticker", "Verdict", "Business Quality", "Financial Perf", "Cash Flow",
-                "Debt/Capital", "Governance", "Valuation", "Red Flags", "Summary"]
-    for col, header in enumerate(headers, 1):
-        cell = ws.cell(row=3, column=col, value=header)
-        cell.font = HEADER_FONT
-        cell.fill = HEADER_FILL
-        cell.border = THIN_BORDER
-
-    for idx, result in enumerate(data.get("results", []), 4):
-        scores = result.get("layer_scores", result.get("dd_scores", {}))
-        verdict = result.get("verdict", "")
-        values = [
-            result.get("ticker", ""),
-            verdict,
-            scores.get("business_quality", ""),
-            scores.get("financial_performance", ""),
-            scores.get("cash_flow_reality", ""),
-            scores.get("debt_capital_structure", scores.get("debt_quality", "")),
-            scores.get("ownership_governance", ""),
-            scores.get("valuation", ""),
-            ", ".join(result.get("red_flags", [])) if result.get("red_flags") else "None",
-            result.get("one_line_summary", ""),
-        ]
-        for col, val in enumerate(values, 1):
-            cell = ws.cell(row=idx, column=col, value=val)
-            cell.font = NORMAL_FONT
-            cell.border = THIN_BORDER
-            if col == 2:
-                cell.fill = verdict_fill(verdict)
-                cell.font = VERDICT_FONT
-    wb.save(str(output_path))
-    return output_path
+def score_value(row: dict[str, Any]) -> float | None:
+    s = row.get("composite_score", row.get("score"))
+    x=num(s)
+    if x is not None:
+        return round(x*10,1) if 0 <= x <= 1 else round(x,1)
+    scores = row.get("layer_scores") or row.get("dd_scores") or {}
+    vals=[num(scores.get(k)) for k,_ in LAYER_KEYS if num(scores.get(k)) is not None]
+    return round(sum(vals)/len(vals),1) if vals else None
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Convert JSON DD results to formatted Excel")
-    parser.add_argument("--date", help="Specific date (YYYY-MM-DD)")
-    parser.add_argument("--dd", action="store_true", help="Convert DD scan results (not screener)")
-    parser.add_argument("--all", action="store_true", help="Convert all available dates")
-    args = parser.parse_args()
+def verdict_fill(verdict: Any) -> PatternFill:
+    v=str(verdict or "").upper().replace(" ", "_")
+    if "DEEP_VALUE" in v or ("DEEP" in v and "VALUE" in v): return GREEN_FILL
+    if "VALUE_TRAP" in v or "TRAP" in v: return ORANGE_FILL
+    if "NOT_INVEST" in v or "NOT" in v or "AVOID" in v: return RED_FILL
+    return PatternFill("solid", fgColor=GREY)
 
-    target_date = args.date or datetime.now().strftime("%Y-%m-%d")
 
-    if args.all:
-        # Find all JSON files
-        files = sorted(RESULTS_DIR.glob("*.json"))
-        if not files:
-            print("No JSON files found in", RESULTS_DIR)
-            return
-        for f in files:
-            suffix = "_screener" if "screener" in f.name else ""
-            out = f.with_suffix(".xlsx")
-            data = json.loads(f.read_text())
-            if "screener" in f.name:
-                convert_screener(data, out)
+def normalize_results(data: Any) -> list[dict[str, Any]]:
+    if isinstance(data, list): return [r for r in data if isinstance(r, dict)]
+    if not isinstance(data, dict): return []
+    if isinstance(data.get("results"), list): return data["results"]
+    if isinstance(data.get("top_picks"), list): return data["top_picks"]
+    if data.get("ticker"): return [data]
+    return []
+
+
+def apply_title(ws, title: str, subtitle: str, last_col: int) -> None:
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=last_col)
+    ws.cell(1,1,title).fill=TITLE_FILL; ws.cell(1,1).font=TITLE_FONT; ws.cell(1,1).alignment=Alignment(horizontal="left", vertical="center")
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=last_col)
+    ws.cell(2,1,subtitle).font=SUBTITLE_FONT
+    ws.row_dimensions[1].height=24
+
+
+def style_headers(ws, row: int, headers: list[str]) -> None:
+    for c,h in enumerate(headers,1):
+        cell=ws.cell(row,c,h); cell.fill=HEADER_FILL; cell.font=HEADER_FONT; cell.border=THIN_BORDER; cell.alignment=Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.auto_filter.ref=f"A{row}:{get_column_letter(len(headers))}{ws.max_row}"
+    ws.freeze_panes="A5"
+
+
+def score_style(cell) -> None:
+    v=num(cell.value)
+    if v is None: return
+    cell.number_format='0.0'
+    if v > 7: cell.fill=GREEN_FILL; cell.font=Font("Calibri",10,bold=True,color=WHITE)
+    elif v >= 4: cell.fill=ORANGE_FILL; cell.font=Font("Calibri",10,bold=True,color=WHITE)
+    else: cell.fill=RED_FILL; cell.font=Font("Calibri",10,bold=True,color=WHITE)
+
+
+def finish_sheet(ws, header_row: int, max_width: int = 30) -> None:
+    for r in range(header_row+1, ws.max_row+1):
+        base = ZEBRA_FILL if (r-header_row) % 2 == 0 else WHITE_FILL
+        for c in range(1, ws.max_column+1):
+            cell=ws.cell(r,c); cell.border=THIN_BORDER
+            if not cell.font or cell.font == Font(): cell.font=NORMAL_FONT
+            if cell.fill.fill_type is None: cell.fill=base
+            cell.alignment=Alignment(vertical="top", wrap_text=True)
+    for col in range(1, ws.max_column+1):
+        letter=get_column_letter(col); width=10
+        for cell in ws[letter]:
+            if cell.value is not None:
+                width=max(width, min(max_width, len(str(cell.value))+2))
+        ws.column_dimensions[letter].width=max(10, min(max_width, width))
+
+
+def add_score_conditional(ws, col: int, first: int, last: int) -> None:
+    if last < first: return
+    rng=f"{get_column_letter(col)}{first}:{get_column_letter(col)}{last}"
+    ws.conditional_formatting.add(rng, CellIsRule(operator='greaterThan', formula=['7'], fill=GREEN_FILL, font=Font(color=WHITE,bold=True)))
+    ws.conditional_formatting.add(rng, CellIsRule(operator='between', formula=['4','7'], fill=ORANGE_FILL, font=Font(color=WHITE,bold=True)))
+    ws.conditional_formatting.add(rng, CellIsRule(operator='lessThan', formula=['4'], fill=RED_FILL, font=Font(color=WHITE,bold=True)))
+
+
+def convert_screener(data: dict[str, Any], output_path: Path):
+    rows=sorted(normalize_results(data), key=lambda r: score_value(r) or -999, reverse=True)
+    wb=Workbook(); ws=wb.active; ws.title="Summary"; ws.sheet_properties.tabColor="1D9BF0"
+    headers=["Rank","Ticker","Sector","Industry","Market Cap","Composite Score","P/E","P/B","P/FCF","FCF Yield","Debt/Eq","ROE","Revenue Growth","Verdict","Next Step"]
+    passing=data.get('candidates_passing_filters', len(rows)); screened=data.get('candidates_screened', len(rows)); date=data.get('date', datetime.now(timezone.utc).date().isoformat())
+    apply_title(ws, f"Russell 2000 Value Screener — {date}", f"Screened: {screened} tickers | Passing: {passing} | Phase 1 only (run dd_scan.py --ticker TICKER for full DD) | Source: FMP /stable/ + Polygon + UW + SEC EDGAR", len(headers))
+    style_headers(ws,4,headers)
+    DASH = "—"
+    has_any_dd = any((r.get('dd_verdict') or r.get('verdict')) for r in rows)
+    for i,r in enumerate(rows,5):
+        km=r.get('key_metrics',{}) if isinstance(r.get('key_metrics'),dict) else {}
+        verdict_raw = r.get('dd_verdict') or r.get('verdict')
+        verdict_display = verdict_raw or "Pending DD"
+        summary = r.get('dd_summary') or r.get('one_line_summary') or r.get('summary')
+        next_step = summary if summary else f"uv run scripts/dd_scan.py --ticker {r.get('ticker')}"
+        vals=[i-4,r.get('ticker'),r.get('sector') or km.get('sector') or DASH,r.get('industry') or km.get('industry') or DASH,fmt_mcap(market_cap_value(r)),score_value(r),num(r.get('pe') or km.get('p_e')),num(r.get('pb') or km.get('p_b')),num(r.get('pfcf') or km.get('p_fcf')),pct_value(r.get('fcf_yield') if r.get('fcf_yield') is not None else km.get('fcf_margin_latest')),num(r.get('debt_equity') or km.get('debt_to_equity_finviz')),pct_value(r.get('roe') or km.get('roe')),pct_value(r.get('revenue_growth') if r.get('revenue_growth') is not None else km.get('revenue_cagr_5y')),verdict_display,next_step]
+        for c,v in enumerate(vals,1):
+            cell = ws.cell(i,c,v if v is not None else DASH)
+            cell.border=THIN_BORDER
+        # Number formats: P/E, P/B, P/FCF, Debt/Eq are plain decimal numbers
+        for c in [7,8,9,11]:
+            if isinstance(ws.cell(i,c).value, (int, float)):
+                ws.cell(i,c).number_format='0.00'
+        # Percentages: FCF Yield, ROE, Revenue Growth
+        for c in [10,12,13]:
+            if isinstance(ws.cell(i,c).value, (int, float)):
+                ws.cell(i,c).number_format='0.0%'
+        score_style(ws.cell(i,6))
+        ws.cell(i,14).fill=verdict_fill(verdict_raw if verdict_raw else None)
+        ws.cell(i,14).font=VERDICT_FONT
+        ws.cell(i,14).alignment=Alignment(horizontal='center', vertical='center', wrap_text=True)
+    add_score_conditional(ws,6,5,ws.max_row); finish_sheet(ws,4, max_width=42)
+    # Note row at the bottom
+    if not has_any_dd:
+        note_row = ws.max_row + 2
+        ws.merge_cells(start_row=note_row, start_column=1, end_row=note_row, end_column=len(headers))
+        nc = ws.cell(note_row, 1, "Note: Screener (Phase 1) only — no full DD verdict/layer scores. Run: uv run scripts/dd_scan.py --ticker TICKER for the 6-layer DD.")
+        nc.font = Font("Calibri", 10, italic=True, color=GREY)
+        nc.alignment = Alignment(horizontal='left', vertical='center')
+        nc.fill = PatternFill("solid", fgColor=LIGHT)
+
+    ws2=wb.create_sheet("Details"); headers2=["Ticker","Verdict","Composite Score"]+[h for _,h in LAYER_KEYS]+["Red Flags","Catalysts","Next Step"]
+    apply_title(ws2, f"Russell 2000 Value Screener Details — {date}", f"Screened: {screened} tickers | Passing: {passing} | Phase 1 only — full DD requires dd_scan.py", len(headers2))
+    style_headers(ws2,4,headers2)
+    for i,r in enumerate(rows,5):
+        scores=r.get('layer_scores') or r.get('dd_scores') or {}
+        verdict_raw = r.get('dd_verdict') or r.get('verdict')
+        verdict_display = verdict_raw or "Pending DD"
+        red_flags_list = r.get('red_flags') or []
+        catalysts_list = r.get('catalysts') or []
+        red_flags_text = ', '.join(map(str, red_flags_list)) if red_flags_list else DASH
+        catalysts_text = ', '.join(map(str, catalysts_list)) if catalysts_list else DASH
+        next_step = f"uv run scripts/dd_scan.py --ticker {r.get('ticker')}" if not verdict_raw else (r.get('one_line_summary') or r.get('dd_summary') or r.get('summary') or DASH)
+        layer_vals = [num(scores.get(k)) for k,_ in LAYER_KEYS]
+        layer_vals = [(v if v is not None else "Pending DD") for v in layer_vals]
+        score_v = score_value(r)
+        score_display = score_v if score_v is not None else "Pending DD"
+        vals=[r.get('ticker'), verdict_display, score_display] + layer_vals + [red_flags_text, catalysts_text, next_step]
+        for c,v in enumerate(vals,1): ws2.cell(i,c,v).border=THIN_BORDER
+        ws2.cell(i,2).fill=verdict_fill(verdict_raw if verdict_raw else None)
+        ws2.cell(i,2).font=VERDICT_FONT
+        ws2.cell(i,2).alignment=Alignment(horizontal='center', vertical='center', wrap_text=True)
+        for c in range(3,10):
+            if isinstance(ws2.cell(i,c).value, (int, float)):
+                score_style(ws2.cell(i,c))
             else:
-                convert_dd(data, out)
-            print(f"  {f.name} → {out.name}")
-        return
+                ws2.cell(i,c).font=Font("Calibri", 9, italic=True, color=GREY)
+                ws2.cell(i,c).alignment=Alignment(horizontal='center', vertical='center')
+    for c in range(3,10): add_score_conditional(ws2,c,5,ws2.max_row)
+    finish_sheet(ws2,4, max_width=50)
+    wb.save(output_path); return output_path
 
+
+def convert_dd(data: dict[str, Any], output_path: Path, title_date: str | None = None):
+    rows=sorted(normalize_results(data), key=lambda r: score_value(r) or -999, reverse=True)
+    wb=Workbook(); ws=wb.active; ws.title="DD Results"; date=title_date or data.get('date') or datetime.now(timezone.utc).date().isoformat()
+    headers=["Ticker","Verdict","Composite Score"]+[h for _,h in LAYER_KEYS]+["1-Line Summary"]
+    apply_title(ws, f"Due Diligence Scan — {date}", f"Screened: {len(rows)} tickers | Passing: {sum(1 for r in rows if 'DEEP' in str(r.get('verdict') or r.get('dd_verdict')).upper())} | Source: FMP /stable/ + Polygon + UW + SEC EDGAR", len(headers))
+    style_headers(ws,4,headers)
+    for i,r in enumerate(rows,5):
+        scores=r.get('layer_scores') or r.get('dd_scores') or {}; vals=[r.get('ticker'),r.get('verdict') or r.get('dd_verdict') or '',score_value(r)] + [num(scores.get(k)) for k,_ in LAYER_KEYS] + [r.get('one_line_summary') or r.get('dd_summary') or r.get('summary') or '']
+        for c,v in enumerate(vals,1): ws.cell(i,c,v).border=THIN_BORDER
+        ws.cell(i,2).fill=verdict_fill(ws.cell(i,2).value); ws.cell(i,2).font=VERDICT_FONT
+        for c in range(3,10): score_style(ws.cell(i,c))
+    for c in range(3,10): add_score_conditional(ws,c,5,ws.max_row)
+    finish_sheet(ws,4); wb.save(output_path); return output_path
+
+
+def load_watchlist_tickers() -> list[str]:
+    data=json.loads(WATCHLIST.read_text())
+    if isinstance(data, dict) and isinstance(data.get('tickers'), list):
+        data = data['tickers']
+    found=[]
+    def walk(x):
+        if isinstance(x, str):
+            s=x.upper().strip()
+            if s and s.replace('.','').replace('-','').isalnum() and len(s)<=8: found.append(s)
+        elif isinstance(x, dict):
+            if 'ticker' in x: walk(x['ticker'])
+            elif 'symbol' in x: walk(x['symbol'])
+            else:
+                for v in x.values(): walk(v)
+        elif isinstance(x, list):
+            for v in x: walk(v)
+    walk(data)
+    return sorted(dict.fromkeys(found))
+
+
+def run_watchlist() -> dict[str, Any]:
+    spec=importlib.util.spec_from_file_location('dd_scan', SKILL_DIR/'scripts'/'dd_scan.py')
+    mod=importlib.util.module_from_spec(spec); assert spec and spec.loader; sys.modules['dd_scan']=mod; spec.loader.exec_module(mod)  # type: ignore
+    tickers=load_watchlist_tickers(); results=[]
+    for t in tickers:
+        print(f"DD {t}...")
+        try: results.append(mod.analyze_ticker(t))
+        except Exception as exc: results.append({'ticker':t,'verdict':'NOT_INVESTABLE','score':0,'summary':f'ERROR: {exc}','red_flags':[str(exc)]})
+    return {'date': datetime.now(timezone.utc).date().isoformat(), 'generated_at': datetime.now(timezone.utc).isoformat(), 'tickers': tickers, 'results': results}
+
+
+def main() -> int:
+    p=argparse.ArgumentParser(description='Convert JSON DD results to professional Excel')
+    p.add_argument('--date'); p.add_argument('--dd', action='store_true'); p.add_argument('--all', action='store_true'); p.add_argument('--watchlist', action='store_true')
+    args=p.parse_args(); RESULTS_DIR.mkdir(parents=True, exist_ok=True); target=args.date or datetime.now(timezone.utc).date().isoformat()
+    if args.watchlist:
+        data=run_watchlist(); json_path=RESULTS_DIR/f"{data['date']}_watchlist_dd.json"; json_path.write_text(json.dumps(data, indent=2, default=str)); out=json_path.with_suffix('.xlsx'); convert_dd(data,out,data['date']); print(f"Saved: {out}"); return 0
+    if args.all:
+        for f in sorted(RESULTS_DIR.glob('*.json')):
+            data=json.loads(f.read_text()); out=f.with_suffix('.xlsx'); (convert_screener if 'screener' in f.name else convert_dd)(data,out); print(f"{f.name} → {out.name}")
+        return 0
     if args.dd:
-        json_path = RESULTS_DIR / f"{target_date}.json"
-        if not json_path.exists():
-            json_path = RESULTS_DIR / f"{target_date}_NVDA_dd.json"
-        if not json_path.exists():
-            print(f"No DD file found for {target_date}")
-            print(f"Available: {list(RESULTS_DIR.glob('*.json'))}")
-            return
-        data = json.loads(json_path.read_text())
-        out = json_path.with_suffix(".xlsx")
-        convert_dd(data, out)
-        print(f"Saved: {out}")
-    else:
-        json_path = RESULTS_DIR / f"{target_date}_screener.json"
-        if not json_path.exists():
-            print(f"No screener file found for {target_date}")
-            print(f"Available: {list(RESULTS_DIR.glob('*.json'))}")
-            return
-        data = json.loads(json_path.read_text())
-        out = json_path.with_suffix(".xlsx")
-        convert_screener(data, out)
-        print(f"Saved: {out}")
+        cands=[RESULTS_DIR/f"{target}.json", *sorted(RESULTS_DIR.glob(f"{target}_*_dd.json"))]
+        json_path=next((x for x in cands if x.exists()), None)
+        if not json_path: print(f"No DD file found for {target}"); return 1
+        data=json.loads(json_path.read_text()); out=json_path.with_suffix('.xlsx'); convert_dd(data,out,target); print(f"Saved: {out}"); return 0
+    json_path=RESULTS_DIR/f"{target}_screener.json"
+    if not json_path.exists(): print(f"No screener file found for {target}"); return 1
+    data=json.loads(json_path.read_text()); out=json_path.with_suffix('.xlsx'); convert_screener(data,out); print(f"Saved: {out}"); return 0
 
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__': raise SystemExit(main())
