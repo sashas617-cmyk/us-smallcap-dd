@@ -5,8 +5,8 @@
 # ///
 """Single-name US small/mid-cap due-diligence scan.
 
-Uses only working sources: Polygon, Unusual Whales, SEC EDGAR, and Finviz.
-No FMP. No ORTEX. No fake data.
+Uses FMP /stable/ as the primary source, with Polygon, Unusual Whales, SEC EDGAR, and Finviz short-float fallback.
+Legacy dead endpoints are not used.
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from tabulate import tabulate
 WORKSPACE = Path(os.path.expanduser("~/.openclaw/workspace"))
 COMMON_DIR = WORKSPACE / "skills" / "_common"
 sys.path.insert(0, str(COMMON_DIR))
-from api_keys import POLYGON_KEY, UW_KEY, polygon_get  # type: ignore
+from api_keys import FMP_KEY, POLYGON_KEY, UW_KEY, polygon_get  # type: ignore
 
 CACHE_DIR = WORKSPACE / "data" / "dd_cache"
 RESULTS_DIR = WORKSPACE / "data" / "dd_results"
@@ -31,6 +31,7 @@ SEC_TICKERS = "https://www.sec.gov/files/company_tickers.json"
 UA = "OpenClaw us-smallcap-dd scanner contact local-user@example.com"
 FINVIZ_UA = "Mozilla/5.0"
 
+_last_fmp = 0.0
 _last_finviz = 0.0
 _last_sec = 0.0
 
@@ -101,6 +102,53 @@ def finviz_quote(ticker: str) -> dict[str, Any]:
     save_cache(key, data)
     return data
 
+
+
+def fmp_json(endpoint: str, params: dict[str, Any] | None = None, ttl_hours: float = 4, aggressive: bool = False) -> Any | None:
+    """Fetch FMP /stable/ JSON with cache and safe throttle."""
+    global _last_fmp
+    params = dict(params or {})
+    params["apikey"] = FMP_KEY
+    url = f"https://financialmodelingprep.com/stable/{endpoint.lstrip('/')}"
+    key = "fmp_" + re.sub(r"[^A-Za-z0-9]", "_", endpoint + json.dumps(params, sort_keys=True))
+    cached = load_cache(key, ttl_hours)
+    if cached is not None:
+        return cached
+    min_gap = 1.0 if aggressive else 0.20  # 1/sec aggressive, otherwise max 5/sec
+    wait = min_gap - (time.time() - _last_fmp)
+    if wait > 0:
+        time.sleep(wait)
+    _last_fmp = time.time()
+    try:
+        r = requests.get(url, params=params, headers={"User-Agent": UA, "Accept": "application/json"}, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        save_cache(key, data)
+        return data
+    except Exception as exc:
+        msg = str(exc).replace(str(FMP_KEY), "***FMP_KEY***")
+        print(f"WARN: FMP failed for {endpoint}: {msg}", file=sys.stderr)
+        return None
+
+def first_row(x: Any) -> dict[str, Any]:
+    if isinstance(x, list) and x and isinstance(x[0], dict):
+        return x[0]
+    if isinstance(x, dict):
+        return x
+    return {}
+
+def fmp_bundle(ticker: str) -> dict[str, Any]:
+    t = ticker.upper().replace("-", ".")
+    return {
+        "profile": first_row(fmp_json("profile", {"symbol": t}, 4)),
+        "quote": first_row(fmp_json("quote", {"symbol": t}, 1)),
+        "metrics": first_row(fmp_json("key-metrics", {"symbol": t, "period": "annual", "limit": 5}, 4)),
+        "ratios": first_row(fmp_json("ratios-ttm", {"symbol": t}, 4)),
+        "income": first_row(fmp_json("income-statement", {"symbol": t, "period": "annual", "limit": 5}, 4)),
+        "balance": first_row(fmp_json("balance-sheet-statement", {"symbol": t, "period": "annual", "limit": 5}, 4)),
+        "cashflow": first_row(fmp_json("cash-flow-statement", {"symbol": t, "period": "annual", "limit": 5}, 4)),
+        "growth": first_row(fmp_json("financial-growth", {"symbol": t, "period": "annual", "limit": 1}, 4)),
+    }
 
 def polygon_json(url: str, params: dict[str, Any] | None = None, ttl_hours: float = 4) -> Any | None:
     params = dict(params or {})
@@ -267,18 +315,30 @@ def pct_from_finviz(v: Any) -> float | None:
 
 def analyze_ticker(ticker: str) -> dict[str, Any]:
     t = ticker.upper().replace(".", "-")
-    fv = finviz_quote(t)
-    pg = polygon_profile_price(t)
+    fmp = fmp_bundle(t)
+    prof, quote, metrics, ratios, inc, bal, cf = (fmp[k] for k in ("profile", "quote", "metrics", "ratios", "income", "balance", "cashflow"))
+    # Finviz is fallback only for fields FMP lacks or occasionally omits, chiefly short float.
+    fv: dict[str, Any] = {}
     sec = sec_financials(t)
     uw = uw_options(t)
-    market_cap = n(fv.get("Market Cap"))
-    pe, pb, ps = n(fv.get("P/E")), n(fv.get("P/B")), n(fv.get("P/S"))
-    de = n(fv.get("Debt/Eq"))
-    cr = n(fv.get("Current Ratio"))
-    sf = pct_from_finviz(fv.get("Short Float"))
-    roe = pct_from_finviz(fv.get("ROE"))
-    fcf = None
-    if sec.get("operating_cash_flow") is not None and sec.get("capex") is not None:
+    market_cap = n(quote.get("marketCap") or prof.get("marketCap") or metrics.get("marketCap"))
+    price = n(quote.get("price") or prof.get("price"))
+    pe = n(ratios.get("priceEarningsRatioTTM") or metrics.get("peRatio") or quote.get("pe"))
+    pb = n(ratios.get("priceToBookRatioTTM") or metrics.get("pbRatio"))
+    ps = n(ratios.get("priceToSalesRatioTTM") or metrics.get("priceToSalesRatio"))
+    de = n(ratios.get("debtEquityRatioTTM") or metrics.get("debtToEquity"))
+    cr = n(ratios.get("currentRatioTTM") or metrics.get("currentRatio"))
+    sf = n(prof.get("shortFloat"))
+    if sf is not None and sf > 1: sf = sf / 100
+    if sf is None:
+        fv = finviz_quote(t)
+        sf = pct_from_finviz(fv.get("Short Float"))
+    roe = n(ratios.get("returnOnEquityTTM") or metrics.get("roe"))
+    if roe is not None and roe > 1: roe = roe / 100
+    fcf = n(cf.get("freeCashFlow"))
+    if fcf is None and cf.get("operatingCashFlow") is not None and cf.get("capitalExpenditure") is not None:
+        fcf = float(n(cf.get("operatingCashFlow")) or 0) + float(n(cf.get("capitalExpenditure")) or 0)
+    if fcf is None and sec.get("operating_cash_flow") is not None and sec.get("capex") is not None:
         fcf = float(sec["operating_cash_flow"]) - abs(float(sec["capex"]))
     fcf_yield = fcf / market_cap if fcf is not None and market_cap else None
     red = []
@@ -297,13 +357,13 @@ def analyze_ticker(ticker: str) -> dict[str, Any]:
     if roe and roe > 0.10: score += 1
     if sf is not None and sf < 0.10: score += .5
     verdict = "DEEP_VALUE" if score >= 6 and len(red) <= 1 else "VALUE_TRAP" if score >= 3.5 else "NOT_INVESTABLE"
-    res = DDResult(t, pg.get("company") or fv.get("title"), pg.get("price"), market_cap, pg.get("sector"), pe, pb, ps, de, cr, sf, fcf_yield, roe, sec.get("latest_10k"), uw.get("max_pain"), int(uw.get("flow_alert_count") or 0), verdict, round(score, 2), red, f"{verdict}: score {score:.1f}/9, P/E {pe}, P/B {pb}, short float {sf}, max pain {uw.get('max_pain')}.")
+    res = DDResult(t, prof.get("companyName") or quote.get("name") or fv.get("title"), price, market_cap, prof.get("sector"), pe, pb, ps, de, cr, sf, fcf_yield, roe, sec.get("latest_10k"), uw.get("max_pain"), int(uw.get("flow_alert_count") or 0), verdict, round(score, 2), red, f"{verdict}: score {score:.1f}/9, P/E {pe}, P/B {pb}, short float {sf}, max pain {uw.get('max_pain')}.")
     d = asdict(res)
     d["dd_verdict"] = verdict
     d["dd_summary"] = res.summary
     d["red_flags"] = red
+    d["source_primary"] = "FMP /stable/"
     return d
-
 
 def print_summary(d: dict[str, Any]) -> None:
     print(tabulate([[d.get("ticker"), d.get("price"), d.get("market_cap"), d.get("pe"), d.get("pb"), d.get("ps"), d.get("fcf_yield"), d.get("short_float"), d.get("max_pain"), d.get("verdict")]], headers=["Ticker", "Price", "MCap", "P/E", "P/B", "P/S", "FCF Yld", "Short", "MaxPain", "Verdict"], tablefmt="github"))

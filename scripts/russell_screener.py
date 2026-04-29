@@ -5,8 +5,8 @@
 # ///
 """Russell 2000 cheap-stock screener + small-cap DD runner.
 
-Primary sources: Finviz, Polygon, Unusual Whales, SEC EDGAR, and iShares.
-No ORTEX. Bulk filtering uses Finviz; enrichment uses Polygon/UW/SEC/Finviz.
+Primary source: FMP /stable/. Enrichment: Polygon, Unusual Whales, SEC EDGAR. Finviz is fallback only for short float.
+Legacy dead endpoints are not used.
 """
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ COMMON_DIR = WORKSPACE / "skills" / "_common"
 sys.path.insert(0, str(COMMON_DIR))
 
 try:
-    from api_keys import POLYGON_KEY, UW_KEY, polygon_get  # type: ignore
+    from api_keys import FMP_KEY, POLYGON_KEY, UW_KEY, polygon_get  # type: ignore
     from bs4 import BeautifulSoup
 except Exception as exc:  # pragma: no cover
     raise SystemExit(f"Failed to import API keys/deps from {COMMON_DIR}: {exc}")
@@ -70,6 +70,7 @@ SPSC SPXC SRRK STAA SUPN SYNA TBBK TPH TSEM UMBF VIRT VLY WDFC WFRD WK XPEL YOU 
 SP600_FALLBACK = FALLBACK_R2K[:]
 
 _last_request = 0.0
+_last_fmp = 0.0
 
 def rate_limit() -> None:
     global _last_request
@@ -148,6 +149,38 @@ def uw_json(url: str, ttl_hours: float = 4) -> Any | None:
         return None
 
 
+
+def fmp_json(endpoint: str, params: dict[str, Any] | None = None, ttl_hours: float = 4, aggressive: bool = False) -> Any | None:
+    global _last_fmp
+    params = dict(params or {})
+    params["apikey"] = FMP_KEY
+    key = "fmp_" + hashlib.md5((endpoint + json.dumps(params, sort_keys=True)).encode()).hexdigest()
+    cached = load_cache(key, ttl_hours)
+    if cached is not None:
+        return cached
+    min_gap = 1.0 if aggressive else 0.20
+    wait = min_gap - (time.time() - _last_fmp)
+    if wait > 0:
+        time.sleep(wait)
+    _last_fmp = time.time()
+    try:
+        r = requests.get(f"https://financialmodelingprep.com/stable/{endpoint.lstrip('/')}", params=params, headers={"User-Agent": UA, "Accept": "application/json"}, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        save_cache(key, data)
+        return data
+    except Exception as exc:
+        msg = str(exc).replace(str(FMP_KEY), "***FMP_KEY***")
+        print(f"WARN: FMP fetch failed {endpoint}: {msg}", file=sys.stderr)
+        return None
+
+def first_row(x: Any) -> dict[str, Any]:
+    if isinstance(x, list) and x and isinstance(x[0], dict):
+        return x[0]
+    if isinstance(x, dict):
+        return x
+    return {}
+
 def fetch_ishares_universe() -> list[str]:
     cached = load_cache("ishares_iwm_holdings", 24)
     if cached:
@@ -171,33 +204,6 @@ def fetch_ishares_universe() -> list[str]:
     except Exception as exc:
         print(f"WARN: iShares universe failed, using fallback: {exc}", file=sys.stderr)
     return FALLBACK_R2K
-
-def finviz_screener() -> list[dict[str, Any]]:
-    cached = load_cache("finviz_screener_small_mid_value", 6)
-    if cached is not None:
-        return cached
-    rows: list[dict[str, Any]] = []
-    base = "https://finviz.com/screener.ashx?v=152&f=cap_small,mid,fa_pe_u15&ft=4"
-    for page in range(1, 121, 20):
-        rate_limit()
-        try:
-            r = requests.get(base + f"&r={page}", headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
-            r.raise_for_status()
-            soup = BeautifulSoup(r.text, "html.parser")
-            table_rows = soup.select('tr[valign="top"]')
-            if not table_rows:
-                break
-            for tr in table_rows:
-                cells = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
-                if len(cells) >= 12 and re.fullmatch(r"[A-Z][A-Z0-9.-]{0,6}", cells[1]):
-                    rows.append({"symbol": cells[1].replace(".", "-"), "companyName": cells[2], "sector": cells[3], "industry": cells[4], "marketCap": cells[6], "pe": cells[7], "price": cells[8], "change": cells[9], "volume": cells[10]})
-            if len(table_rows) < 20:
-                break
-        except Exception as exc:
-            print(f"WARN: Finviz screener failed: {exc}", file=sys.stderr)
-            break
-    save_cache("finviz_screener_small_mid_value", rows)
-    return rows
 
 def finviz_quote(ticker: str) -> dict[str, Any]:
     key = f"finviz_quote_{ticker}"
@@ -249,10 +255,20 @@ def sec_financials(ticker: str) -> dict[str, Any]:
     return {"revenue": fact("Revenues") or fact("RevenueFromContractWithCustomerExcludingAssessedTax"), "net_income": fact("NetIncomeLoss"), "equity": fact("StockholdersEquity"), "debt": fact("LongTermDebt") or fact("LongTermDebtAndFinanceLeaseObligationsCurrentAndNoncurrent"), "ocf": ocf, "capex": capex, "latest_10k": latest_10k}
 
 def fetch_bulk_screener() -> list[dict[str, Any]]:
-    return finviz_screener()
+    # /stable/ has no stock screener. Start from stock-list, then enrich per ticker.
+    data = fmp_json("stock-list", ttl_hours=24) or []
+    rows: list[dict[str, Any]] = []
+    if isinstance(data, list):
+        for r in data:
+            if not isinstance(r, dict):
+                continue
+            sym = str(r.get("symbol") or "").upper().replace(".", "-")
+            if re.fullmatch(r"[A-Z][A-Z0-9-]{0,5}", sym) and str(r.get("exchangeShortName") or "").upper() in {"NASDAQ", "NYSE", "AMEX"}:
+                rows.append({"symbol": sym, "companyName": r.get("name"), "price": r.get("price"), "exchange": r.get("exchangeShortName")})
+    return rows
 
 def fetch_available_symbols() -> list[str]:
-    return []
+    return [str(r.get("symbol", "")).upper() for r in fetch_bulk_screener()]
 
 def n(x: Any) -> float | None:
     if x in (None, "", "-", "N/A"):
@@ -303,45 +319,51 @@ class Candidate:
 
 def enrich_ticker(ticker: str, screener_row: dict[str, Any] | None = None) -> Candidate:
     row = screener_row or {}
-    fq = finviz_quote(ticker)
-    pg = polygon_json(f"https://api.polygon.io/v1/meta/symbols/{ticker}/company", ttl_hours=24) or {}
+    tsym = ticker.upper().replace("-", ".")
+    prof = first_row(fmp_json("profile", {"symbol": tsym}, 4))
+    quote = first_row(fmp_json("quote", {"symbol": tsym}, 1))
+    metrics = first_row(fmp_json("key-metrics", {"symbol": tsym, "period": "annual", "limit": 5}, 4))
+    ratios = first_row(fmp_json("ratios-ttm", {"symbol": tsym}, 4))
+    inc = first_row(fmp_json("income-statement", {"symbol": tsym, "period": "annual", "limit": 5}, 4))
+    cf = first_row(fmp_json("cash-flow-statement", {"symbol": tsym, "period": "annual", "limit": 5}, 4))
+    growth = first_row(fmp_json("financial-growth", {"symbol": tsym, "period": "annual", "limit": 1}, 4))
     sec = sec_financials(ticker)
-    prev = polygon_json(f"https://api.polygon.io/v2/aggs/ticker/{ticker}/prev", ttl_hours=2) or {}
     uw_mp = uw_json(f"https://api.unusualwhales.com/api/stock/{ticker}/max-pain", ttl_hours=12) or {}
 
-    market_cap = n(row.get("marketCap")) or n(fq.get("Market Cap")) or n(pg.get("marketcap"))
-    pe = n(row.get("pe")) or n(fq.get("P/E"))
-    forward_pe = n(fq.get("Forward P/E"))
-    pb = n(fq.get("P/B"))
-    ps = n(fq.get("P/S"))
-    pfcf = n(fq.get("P/FCF"))
-    debt_equity = n(fq.get("Debt/Eq"))
-    current_ratio = n(fq.get("Current Ratio"))
-    roe = (n(fq.get("ROE")) / 100) if n(fq.get("ROE")) is not None else None
-    profit_margin = (n(fq.get("Profit Margin")) / 100) if n(fq.get("Profit Margin")) is not None else None
-    short_float = n(fq.get("Short Float"))
-    if short_float is not None and short_float > 1:
-        short_float = short_float / 100
-    revenue_growth = (n(fq.get("Sales past 5Y")) / 100) if n(fq.get("Sales past 5Y")) is not None else None
-    if revenue_growth is None and sec.get("revenue") and sec.get("revenue_prev"):
-        revenue_growth = yoy_growth(sec.get("revenue"), sec.get("revenue_prev"))
-    fcf = None
-    if sec.get("ocf") is not None and sec.get("capex") is not None:
-        fcf = float(sec["ocf"]) - abs(float(sec["capex"]))
+    market_cap = n(quote.get("marketCap") or prof.get("marketCap") or metrics.get("marketCap"))
+    pe = n(ratios.get("priceEarningsRatioTTM") or metrics.get("peRatio") or quote.get("pe"))
+    forward_pe = n(quote.get("epsEstimatedNextYear"))
+    pb = n(ratios.get("priceToBookRatioTTM") or metrics.get("pbRatio"))
+    ps = n(ratios.get("priceToSalesRatioTTM") or metrics.get("priceToSalesRatio"))
+    pfcf = n(metrics.get("pocfratio") or metrics.get("pfcfRatio"))
+    debt_equity = n(ratios.get("debtEquityRatioTTM") or metrics.get("debtToEquity"))
+    current_ratio = n(ratios.get("currentRatioTTM") or metrics.get("currentRatio"))
+    roe = n(ratios.get("returnOnEquityTTM") or metrics.get("roe"))
+    if roe is not None and roe > 1: roe /= 100
+    profit_margin = n(ratios.get("netProfitMarginTTM") or inc.get("netIncomeRatio"))
+    if profit_margin is not None and profit_margin > 1: profit_margin /= 100
+    short_float = n(prof.get("shortFloat"))
+    if short_float is not None and short_float > 1: short_float /= 100
+    if short_float is None:
+        fq = finviz_quote(ticker)
+        short_float = n(fq.get("Short Float"))
+        if short_float is not None and short_float > 1: short_float /= 100
+    revenue_growth = n(growth.get("revenueGrowth") or growth.get("growthRevenue"))
+    if revenue_growth is not None and revenue_growth > 1: revenue_growth /= 100
+    fcf = n(cf.get("freeCashFlow"))
+    if fcf is None and cf.get("operatingCashFlow") is not None and cf.get("capitalExpenditure") is not None:
+        fcf = float(n(cf.get("operatingCashFlow")) or 0) + float(n(cf.get("capitalExpenditure")) or 0)
     fcf_yield = (fcf / market_cap) if fcf is not None and market_cap else ((1 / pfcf) if pfcf and pfcf > 0 else None)
-    net_income = sec.get("net_income")
+    net_income = n(inc.get("netIncome")) or sec.get("net_income")
     earnings_yield = (net_income / market_cap) if net_income is not None and market_cap else (1 / pe if pe and pe > 0 else None)
-    debt_ebitda = None
-    latest_10k = sec.get("latest_10k")
-
     return Candidate(
-        ticker=ticker, company=pg.get("name") or row.get("companyName"),
-        sector=pg.get("sector") or row.get("sector"), industry=pg.get("industry") or row.get("industry"), market_cap=market_cap,
-        pe=pe, forward_pe=forward_pe, pb=pb, ps=ps, pfcf=pfcf, ev_ebitda=n(fq.get("EV/EBITDA")),
+        ticker=ticker, company=prof.get("companyName") or quote.get("name") or row.get("companyName"),
+        sector=prof.get("sector"), industry=prof.get("industry"), market_cap=market_cap,
+        pe=pe, forward_pe=forward_pe, pb=pb, ps=ps, pfcf=pfcf, ev_ebitda=n(metrics.get("enterpriseValueOverEBITDA")),
         debt_equity=debt_equity, current_ratio=current_ratio, roe=roe, profit_margin=profit_margin,
-        short_float=short_float, inst_own=(n(fq.get("Inst Own")) / 100) if n(fq.get("Inst Own")) is not None else None, revenue_growth=revenue_growth,
-        fcf_yield=fcf_yield, earnings_yield=earnings_yield, debt_ebitda=debt_ebitda,
-        latest_10k=latest_10k, fail_reasons=[])
+        short_float=short_float, inst_own=None, revenue_growth=revenue_growth,
+        fcf_yield=fcf_yield, earnings_yield=earnings_yield, debt_ebitda=None,
+        latest_10k=sec.get("latest_10k"), fail_reasons=[])
 
 def passes(c: Candidate) -> bool:
     reasons: list[str] = []
