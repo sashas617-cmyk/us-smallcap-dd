@@ -359,7 +359,12 @@ def enrich_ticker(ticker: str, screener_row: dict[str, Any] | None = None) -> Ca
     uw_mp = uw_json(f"https://api.unusualwhales.com/api/stock/{ticker}/max-pain", ttl_hours=12) or {}
 
     market_cap = n(quote.get("marketCap") or prof.get("marketCap") or metrics.get("marketCap"))
-    pe = n(ratios.get("priceEarningsRatioTTM") or metrics.get("peRatio") or quote.get("pe"))
+    # P/E: try ratios-ttm, then key-metrics peRatio, then quote, then compute from earningsYield (1/EY)
+    pe = n(ratios.get("priceEarningsRatioTTM") or ratios.get("priceEarningsRatio") or metrics.get("peRatio") or quote.get("pe"))
+    if pe is None:
+        ey = n(metrics.get("earningsYield"))
+        if ey and ey > 0:
+            pe = round(1 / ey, 2)
     forward_pe = n(quote.get("epsEstimatedNextYear"))
     pb = n(ratios.get("priceToBookRatioTTM") or metrics.get("pbRatio"))
     ps = n(ratios.get("priceToSalesRatioTTM") or metrics.get("priceToSalesRatio"))
