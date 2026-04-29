@@ -30,7 +30,7 @@ SUBTITLE_FONT=Font("Calibri", 10, italic=True, color=GREY); NORMAL_FONT=Font("Ca
 VERDICT_FONT=Font("Calibri", 10, bold=True, color=WHITE)
 THIN_BORDER=Border(left=Side("thin", color=BORDER), right=Side("thin", color=BORDER), top=Side("thin", color=BORDER), bottom=Side("thin", color=BORDER))
 
-LAYER_KEYS=[("business_quality","Business"),("financial_performance","Financial"),("cash_flow_reality","Cash Flow"),("debt_capital_structure","Debt/Capital"),("ownership_governance","Governance"),("valuation","Valuation")]
+LAYER_KEYS=[("business_quality","Business (Phase 1)"),("financial_performance","Financial (Phase 1)"),("cash_flow_reality","Cash Flow"),("debt_capital_structure","Debt/Capital"),("ownership_governance","Governance"),("valuation","Valuation")]
 
 
 def num(x: Any) -> float | None:

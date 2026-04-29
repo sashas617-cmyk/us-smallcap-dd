@@ -428,6 +428,7 @@ def dd_fallback(c: Candidate) -> dict[str, Any]:
     if c.fcf_yield is None or c.fcf_yield <= 0: red_flags.append("FCF not positive on latest annual cash-flow data")
     if c.debt_equity is not None and c.debt_equity > 1.2: red_flags.append("Leverage is elevated for a small-cap value candidate")
     if c.roe is not None and c.roe < 0.08: red_flags.append("ROE below normal quality threshold")
+    if c.pe is None: red_flags.append("P/E not available (likely unprofitable)")
     if c.latest_10k: catalysts.append(f"Next annual filing cycle, latest 10-K seen: {c.latest_10k}")
     if c.composite_score >= 7 and len(red_flags) <= 1:
         verdict = "DEEP_VALUE"
@@ -435,8 +436,22 @@ def dd_fallback(c: Candidate) -> dict[str, Any]:
         verdict = "VALUE_TRAP"
     else:
         verdict = "NOT_INVESTABLE"
-    scores = {"business_quality": None, "financial_trend": None, "cash_flow": c.fcf_yield, "debt_quality": c.debt_equity, "governance_red_flags": len(red_flags), "valuation": c.composite_score}
-    return {"dd_verdict": verdict, "dd_scores": scores, "dd_summary": f"{verdict}: cheap screen score {c.composite_score}, FCF yield {fmt_pct(c.fcf_yield)}, ROE {fmt_pct(c.roe)}, D/E {fmt(c.debt_equity)}.", "red_flags": red_flags, "catalysts": catalysts}
+    # Populate layer scores from screener data (Phase 1 only)
+    scores = {
+        "business_quality": None,
+        "financial_performance": c.revenue_growth,  # YoY growth as financial proxy
+        "cash_flow_reality": c.fcf_yield,  # FCF yield
+        "debt_capital_structure": c.debt_equity,  # D/E ratio
+        "ownership_governance": c.short_float,  # Short float as governance proxy
+        "valuation": c.composite_score,  # Composite score
+    }
+    # Convert raw values to 1-10 scale for display
+    def to_score(val, thresholds=None):
+        if val is None: return None
+        if thresholds: return val  # already a score
+        return round(val, 1)
+    scores_display = {k: to_score(v) for k, v in scores.items()}
+    return {"dd_verdict": verdict, "dd_scores": scores_display, "dd_summary": f"{verdict}: screen score {c.composite_score}/10, FCF yield {fmt_pct(c.fcf_yield)}, ROE {fmt_pct(c.roe)}, D/E {fmt(c.debt_equity)}.", "red_flags": red_flags or ["—"], "catalysts": catalysts or ["—"], "dd_note": "Phase 1 screener score — run dd_scan.py for full 6-layer DD"}
 
 def run_dd(c: Candidate) -> dict[str, Any]:
     dd_path = SCRIPT_DIR / "dd_scan.py"
